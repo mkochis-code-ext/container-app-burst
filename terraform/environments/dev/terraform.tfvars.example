@@ -1,0 +1,18 @@
+location           = "eastus"
+environment_prefix = "dev"
+workload           = "containerappburst"
+
+# Required: Azure supports T4 and A100 serverless GPU profiles in East US.
+gpu_type = "T4"
+
+# Initial Terraform apply can use the public sample image. The deployment script
+# replaces this value with <acr>.azurecr.io/number-worker:<tag> after the image
+# is built and pushed.
+worker_image     = "mcr.microsoft.com/k8se/quickstart-jobs"
+worker_image_tag = "latest"
+
+# bootstrap   = phase 1: everything public, no private endpoints or Container Apps.
+# private     = phase 2: private endpoints/DNS, public access off, Container Apps.
+# maintenance = like private, with public access temporarily on (day-2 changes).
+# Never go from private/maintenance back to bootstrap. scripts/deploy.ps1 sets this.
+network_mode = "bootstrap"

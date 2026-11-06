@@ -1,0 +1,164 @@
+name: Terraform and Application CI/CD
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "terraform/**"
+      - "number-worker/**"
+      - "timer-function/**"
+      - "scripts/**"
+      - ".github/workflows/main.yml"
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Deployment stage"
+        required: true
+        default: "Dev"
+        type: choice
+        options:
+          - Dev
+      gpu_type:
+        description: "Container Apps GPU profile"
+        required: true
+        default: "T4"
+        type: choice
+        options:
+          - T4
+          - A100
+      phase:
+        description: "Full = public bootstrap then private lockdown. Maintenance = temporarily re-open public access for day-2 changes."
+        required: true
+        default: "Full"
+        type: choice
+        options:
+          - Full
+          - Bootstrap
+          - Lockdown
+          - Maintenance
+      rebuild_image:
+        description: "Maintenance only: rebuild and roll out the worker image"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.14.2"
+  DOTNET_VERSION: "10.0.x"
+
+jobs:
+  ci:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore and build
+        run: dotnet build ContainerAppBurst.slnx --configuration Release --nologo
+
+      - name: Run tests
+        run: dotnet test ContainerAppBurst.slnx --configuration Release --no-build --nologo
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Format check
+        run: terraform fmt -check -recursive terraform
+
+      - name: Configure remote state
+        working-directory: terraform/environments/dev
+        run: |
+          cat > backend.tf <<'EOF'
+          terraform {
+            backend "azurerm" {
+              storage_account_name = "${{ secrets.TF_STATE_STORAGE_ACCOUNT }}"
+              container_name       = "tfstate"
+              key                  = "dev.terraform.tfstate"
+              resource_group_name  = "${{ secrets.TF_STATE_RESOURCE_GROUP }}"
+              use_azuread_auth     = true
+            }
+          }
+          EOF
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.ARM_CLIENT_ID }}
+          client-secret: ${{ secrets.ARM_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Terraform init
+        working-directory: terraform/environments/dev
+        run: terraform init
+
+      - name: Terraform validate
+        working-directory: terraform/environments/dev
+        run: terraform validate
+
+      - name: Terraform plan
+        working-directory: terraform/environments/dev
+        env:
+          TF_VAR_location: ${{ secrets.DEV_LOCATION || 'eastus' }}
+          TF_VAR_gpu_type: ${{ secrets.DEV_GPU_TYPE }}
+          # Plan against the steady-state (locked-down) configuration.
+          TF_VAR_network_mode: private
+        run: terraform plan -input=false
+
+  # One hosted job runs every phase. Phase 1 is public and phase 2 is a
+  # control-plane-only Terraform apply, so no private runner or VPN is needed.
+  deploy-dev:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.stage == 'Dev' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.ARM_CLIENT_ID }}
+          client-secret: ${{ secrets.ARM_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Deploy
+        shell: pwsh
+        env:
+          PHASE: ${{ github.event.inputs.phase }}
+          GPU_TYPE: ${{ github.event.inputs.gpu_type }}
+          LOCATION: ${{ secrets.DEV_LOCATION || 'eastus' }}
+          REBUILD_IMAGE: ${{ github.event.inputs.rebuild_image }}
+          TF_STATE_STORAGE_ACCOUNT: ${{ secrets.TF_STATE_STORAGE_ACCOUNT }}
+          TF_STATE_RESOURCE_GROUP: ${{ secrets.TF_STATE_RESOURCE_GROUP }}
+        run: |
+          $arguments = @{
+            Environment           = "dev"
+            GpuType               = $env:GPU_TYPE
+            Location              = $env:LOCATION
+            Phase                 = $env:PHASE
+            SkipLogin             = $true
+            TfStateStorageAccount = $env:TF_STATE_STORAGE_ACCOUNT
+            TfStateResourceGroup  = $env:TF_STATE_RESOURCE_GROUP
+          }
+          if ($env:REBUILD_IMAGE -eq "true") { $arguments.RebuildImage = $true }
+          ./scripts/deploy.ps1 @arguments

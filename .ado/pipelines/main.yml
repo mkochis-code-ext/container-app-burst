@@ -1,0 +1,143 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+parameters:
+  - name: phase
+    displayName: Deployment phase (Full = public bootstrap then private lockdown; Maintenance = temporarily re-open public access)
+    type: string
+    default: Full
+    values:
+      - Full
+      - Bootstrap
+      - Lockdown
+      - Maintenance
+  - name: rebuildImage
+    displayName: Maintenance only - rebuild and roll out the worker image
+    type: boolean
+    default: false
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: terraform-secrets
+  - name: TF_VERSION
+    value: 1.14.2
+  - name: DOTNET_VERSION
+    value: 10.0.x
+
+stages:
+  - stage: CI
+    displayName: Build and Plan
+    condition: eq(variables['Build.Reason'], 'PullRequest')
+    jobs:
+      - job: Validate
+        steps:
+          - checkout: self
+
+          - task: UseDotNet@2
+            inputs:
+              packageType: sdk
+              version: $(DOTNET_VERSION)
+
+          - script: dotnet build ContainerAppBurst.slnx --configuration Release --nologo
+            displayName: Build solution
+
+          - script: dotnet test ContainerAppBurst.slnx --configuration Release --no-build --nologo
+            displayName: Run tests
+
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - script: terraform fmt -check -recursive terraform
+            displayName: Terraform format check
+
+          - script: |
+              cat > terraform/environments/dev/backend.tf <<'EOF'
+              terraform {
+                backend "azurerm" {
+                  storage_account_name = "$(TF_STATE_STORAGE_ACCOUNT)"
+                  container_name       = "tfstate"
+                  key                  = "dev.terraform.tfstate"
+                  resource_group_name  = "$(TF_STATE_RESOURCE_GROUP)"
+                  use_azuread_auth     = true
+                }
+              }
+              EOF
+            displayName: Configure remote state
+
+          - script: terraform init
+            workingDirectory: terraform/environments/dev
+            env:
+              ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+              ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+              ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+              ARM_TENANT_ID: $(ARM_TENANT_ID)
+
+          - script: terraform validate
+            workingDirectory: terraform/environments/dev
+
+          - script: terraform plan -input=false
+            workingDirectory: terraform/environments/dev
+            env:
+              ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+              ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+              ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+              ARM_TENANT_ID: $(ARM_TENANT_ID)
+              TF_VAR_location: $(DEV_LOCATION)
+              TF_VAR_gpu_type: $(DEV_GPU_TYPE)
+              # Plan against the steady-state (locked-down) configuration.
+              TF_VAR_network_mode: private
+
+  # One hosted deployment runs every phase. Phase 1 is public and phase 2 is a
+  # control-plane-only Terraform apply, so no private agent or VPN is needed.
+  - stage: CD
+    displayName: Deploy Dev
+    condition: and(eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - deployment: DeployDev
+        environment: dev
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: UseDotNet@2
+                  inputs:
+                    packageType: sdk
+                    version: $(DOTNET_VERSION)
+
+                - task: TerraformInstaller@1
+                  inputs:
+                    terraformVersion: $(TF_VERSION)
+
+                - task: AzureCLI@2
+                  displayName: Deploy (${{ parameters.phase }})
+                  inputs:
+                    azureSubscription: terraform-cicd
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    workingDirectory: $(Build.SourcesDirectory)
+                    inlineScript: |
+                      $location = "$(DEV_LOCATION)"
+                      if (-not $location) { $location = "eastus" }
+                      $arguments = @{
+                        Environment           = "dev"
+                        GpuType               = "$(DEV_GPU_TYPE)"
+                        Location              = $location
+                        Phase                 = "${{ parameters.phase }}"
+                        SkipLogin             = $true
+                        TfStateStorageAccount = "$(TF_STATE_STORAGE_ACCOUNT)"
+                        TfStateResourceGroup  = "$(TF_STATE_RESOURCE_GROUP)"
+                      }
+                      if ("${{ parameters.rebuildImage }}" -eq "True") { $arguments.RebuildImage = $true }
+                      ./scripts/deploy.ps1 @arguments

@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/number-worker.tests/">
+    <Project Path="number-worker.tests/NumberWorker.Tests.csproj" />
+  </Folder>
+  <Folder Name="/number-worker/">
+    <Project Path="number-worker/NumberWorker.csproj" />
+  </Folder>
+  <Folder Name="/timer-function/">
+    <Project Path="timer-function/TimerFunction.csproj" />
+  </Folder>
+</Solution>

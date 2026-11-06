@@ -1,0 +1,30 @@
+# .NET
+**/bin/
+**/obj/
+*.user
+*.suo
+*.vs/
+.vs/
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# Local secrets and environment files
+*.env
+.env*
+terraform.tfvars
+!terraform.tfvars.example
+**/local.settings.json
+**/backend.tf
+
+# Build output
+artifacts/
+
+# IDE/editor
+.vscode/
+.idea/
